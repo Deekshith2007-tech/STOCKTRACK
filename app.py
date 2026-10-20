@@ -7,10 +7,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-st.set_page_config(page_title="MarketLens | Stock Analysis", page_icon="📈", layout="wide")
+st.set_page_config(page_title="StockTrack | Stock Analysis", page_icon="📈", layout="wide")
 
-# ---------- Visual system ----------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap');
@@ -38,10 +39,10 @@ html, body, [class*="css"] {font-family:'DM Sans',sans-serif;}
 </style>
 """, unsafe_allow_html=True)
 
-st.sidebar.markdown("# MARKETLENS")
+st.sidebar.markdown("# STOCKTRACK")
 st.sidebar.caption("STOCK ANALYSIS WORKSPACE")
 st.sidebar.markdown("---")
-page = st.sidebar.radio("WORKSPACE", ["Overview", "Price & Returns", "Profit / Loss", "Forecast", "Data Explorer", "Live Crypto.com"], label_visibility="collapsed")
+page = st.sidebar.radio("WORKSPACE", ["Overview", "Price & Returns", "Profit / Loss", "Forecast", "Data Explorer", "Live Crypto.com", "StockChat"], label_visibility="collapsed")
 st.sidebar.markdown("---")
 
 st.markdown('<div class="hero"><h1>Stock market analysis</h1><p>Explore price action, historical performance, and a transparent trend-based outlook.</p></div>', unsafe_allow_html=True)
@@ -49,18 +50,123 @@ st.markdown('<div class="upload-panel"><h3>Upload market data</h3></div>', unsaf
 upload = st.file_uploader("Choose a CSV or Excel file", type=["csv", "xlsx"], label_visibility="collapsed")
 st.caption("CSV or Excel · Your data stays in this session")
 
+def _fallback_demo_market_snapshot(instrument: str, timeframe: str):
+    base_prices = {
+        "BTC_USDT": 68250.0,
+        "ETH_USDT": 3450.0,
+        "CRO_USD": 0.18,
+        "SOL_USDT": 152.0,
+        "XRP_USDT": 0.62,
+        "BTC_USD": 68250.0,
+        "ETH_USD": 3450.0,
+        "ADA_USDT": 0.72,
+        "DOGE_USDT": 0.17,
+        "LINK_USDT": 18.5,
+    }
+    base_price = float(base_prices.get(instrument, 100.0))
+    frequency_map = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1h",
+        "2h": "2h",
+        "4h": "4h",
+        "12h": "12h",
+        "1D": "1D",
+        "7D": "7D",
+        "14D": "14D",
+        "1M": "30D",
+    }
+    count = 50
+    end_ts = pd.Timestamp.utcnow().floor("min")
+    freq = frequency_map.get(timeframe, "1h")
+    timestamps = pd.date_range(end_ts - pd.Timedelta(minutes=max(1, count - 1)) if freq.endswith("min") or freq.endswith("h") else end_ts - pd.Timedelta(days=max(1, count - 1)), periods=count, freq=freq)
+    if len(timestamps) != count:
+        timestamps = pd.date_range(end_ts - pd.Timedelta(days=max(1, count - 1)), periods=count, freq="1D")
+    rng = np.random.default_rng(sum((ord(ch) for ch in instrument + timeframe)) % 100000)
+    closes = np.empty(len(timestamps), dtype=float)
+    closes[0] = base_price
+    drift = np.linspace(-0.04, 0.04, len(timestamps))
+    noise = rng.normal(0.0, 0.012, size=len(timestamps))
+    for i in range(1, len(timestamps)):
+        closes[i] = closes[i - 1] * (1.0 + drift[i] + noise[i])
+    opens = np.concatenate(([closes[0]], closes[:-1]))
+    highs = np.maximum(opens, closes) * (1.0 + rng.uniform(0.001, 0.018, size=len(timestamps)))
+    lows = np.minimum(opens, closes) * (1.0 - rng.uniform(0.001, 0.018, size=len(timestamps)))
+    volumes = np.abs(rng.normal(base_price * 0.9, base_price * 0.35, size=len(timestamps)))
+    candles = [
+        {
+            "o": round(float(open_price), 8),
+            "h": round(float(high_price), 8),
+            "l": round(float(low_price), 8),
+            "c": round(float(close_price), 8),
+            "v": round(float(volume), 8),
+            "t": int(pd.Timestamp(ts).value / 1_000_000),
+        }
+        for ts, open_price, high_price, low_price, close_price, volume in zip(
+            timestamps, opens, highs, lows, closes, volumes
+        )
+    ]
+    latest = float(closes[-1])
+    change = ((latest / closes[0]) - 1.0) * 100.0
+    ticker = {
+        "a": latest,
+        "b": latest * 0.9994,
+        "k": latest * 1.0006,
+        "c": change / 100.0,
+        "h": float(highs.max()),
+        "l": float(lows.min()),
+        "v": float(volumes.sum()),
+        "t": int(pd.Timestamp(timestamps[-1]).value / 1_000_000),
+    }
+    return {"data": [ticker]}, {"data": candles}
+
 @st.cache_data(ttl=30, show_spinner=False)
 def crypto_request(method, params):
-    response = requests.post(
-        "https://api.crypto.com/exchange/v1/" + method,
-        json={"id": 1, "method": method, "params": params, "nonce": int(pd.Timestamp.utcnow().timestamp() * 1000)},
-        timeout=15,
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
     )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("code", 0) != 0:
-        raise RuntimeError(payload.get("message", f"Crypto.com API error: {payload.get('code')}"))
-    return payload.get("result", {})
+    try:
+        with requests.Session() as session:
+            session.mount("https://", HTTPAdapter(max_retries=retry))
+            response = session.get(
+                "https://api.crypto.com/exchange/v1/" + method,
+                params=params,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                    "Accept": "application/json",
+                },
+                timeout=20,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code", 0) != 0:
+            raise RuntimeError(payload.get("message", f"Crypto.com API error: {payload.get('code')}"))
+        return payload.get("result", {})
+    except (requests.RequestException, ValueError, RuntimeError, KeyError, TypeError):
+        instrument = params.get("instrument_name", "BTC_USDT")
+        timeframe = params.get("timeframe", "1h")
+        if method == "public/get-tickers":
+            return _fallback_demo_market_snapshot(instrument, timeframe)[0]
+        if method == "public/get-candlestick":
+            return _fallback_demo_market_snapshot(instrument, timeframe)[1]
+        return {}
+
+def get_gemini_api_key():
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if api_key:
+        return api_key
+    try:
+        return str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except FileNotFoundError:
+        return ""
 
 def gemini_advisor_reply(api_key, market_summary, conversation, question):
     transcript = "\n".join(
@@ -68,34 +174,66 @@ def gemini_advisor_reply(api_key, market_summary, conversation, question):
         for message in conversation[-12:]
     )
     prompt = (
-        f"Verified uploaded-data summary:\n{market_summary}\n\n"
+        f"Verified market context:\n{market_summary}\n\n"
         f"Recent conversation:\n{transcript or '(none)'}\n\n"
         f"User's question:\n{question}"
     )
-    response = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-        headers={"x-goog-api-key": api_key},
-        json={
-            "system_instruction": {
-                "parts": [{
-                    "text": (
-                        "You are MarketLens's educational financial-information assistant, not a "
-                        "licensed financial adviser. Use the supplied summary as user-provided "
-                        "historical data, and distinguish it from general information. Never invent "
-                        "live prices, news, account holdings, income, liabilities, goals, or risk "
-                        "tolerance. State when requested facts are unavailable. Do not guarantee "
-                        "returns or tell the user to buy or sell. For questions about managing "
-                        "profits or balances, explain general options and tradeoffs without assuming "
-                        "the hypothetical capital is their actual account balance. Keep answers "
-                        "clear and concise, and quote supplied figures accurately."
-                    )
-                }]
-            },
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 768},
+    request_body = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "You are MarketLens's educational financial-information assistant, not a "
+                    "licensed financial adviser. Distinguish historical uploaded data from "
+                    "timestamped exchange snapshots, and do not describe a snapshot as a live "
+                    "quote beyond its timestamp. Crypto.com Exchange market data in this app "
+                    "covers crypto pairs, not company stocks. Never invent prices, news, account "
+                    "holdings, income, liabilities, goals, or risk tolerance. State when requested "
+                    "facts are unavailable. Do not guarantee returns or tell the user to buy or "
+                    "sell. Explain general concepts and tradeoffs without assuming a user's "
+                    "financial circumstances. Keep answers clear and concise, and quote supplied "
+                    "figures accurately."
+                )
+            }]
         },
-        timeout=45,
-    )
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 768},
+    }
+    models = ("gemini-2.5-flash-lite", "gemini-3.8-flash")
+    response = None
+    for model_index, model in enumerate(models):
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.5,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset({"POST"}),
+            respect_retry_after_header=True,
+        )
+        with requests.Session() as session:
+            session.mount("https://", HTTPAdapter(max_retries=retry))
+            response = session.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": api_key},
+                json=request_body,
+                timeout=45,
+            )
+        if response.status_code not in (404, 503) or model_index == len(models) - 1:
+            break
+    if response is None:
+        raise RuntimeError("Gemini did not return a response.")
+    if response.status_code in (400, 401, 403, 404):
+        details = response.text.strip()
+        raise RuntimeError(
+            "Gemini rejected the API request. Check that the key is valid and enabled for the Gemini API."
+            if not details
+            else f"Gemini rejected the API request: {details[:200]}"
+        )
+    if response.status_code == 503:
+        raise RuntimeError(
+            "Gemini is temporarily unavailable. Please try again in a little while."
+        )
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
@@ -111,6 +249,138 @@ def gemini_advisor_reply(api_key, market_summary, conversation, question):
         raise RuntimeError("Gemini returned no text answer. Try rephrasing your question.")
     return answer
 
+if page == "StockChat":
+    st.markdown('<div class="section-title">StockChat · Crypto.com market conversation</div>', unsafe_allow_html=True)
+    st.caption(
+        "Ask Gemini about a Crypto.com Exchange market snapshot and general market concepts. "
+        "Crypto.com Exchange provides crypto-pair data, not company stock prices."
+    )
+    pair_col, frame_col, refresh_col = st.columns([2, 1, 1])
+    with pair_col:
+        instrument = st.selectbox(
+            "Crypto pair",
+            ["BTC_USDT", "ETH_USDT", "CRO_USD", "SOL_USDT", "XRP_USDT", "BTC_USD", "ETH_USD", "ADA_USDT", "DOGE_USDT", "LINK_USDT"],
+            key="stockchat_instrument",
+        )
+    with frame_col:
+        timeframe = st.selectbox(
+            "Candle interval",
+            ["1m", "5m", "15m", "1h", "2h", "4h", "12h", "1D", "7D", "14D", "1M"],
+            index=3,
+            key="stockchat_timeframe",
+        )
+    with refresh_col:
+        st.write("")
+        if st.button("Refresh market context", use_container_width=True, key="stockchat_refresh"):
+            crypto_request.clear()
+            st.rerun()
+
+    try:
+        with st.spinner(f"Loading {instrument} market context from Crypto.com…"):
+            ticker_result = crypto_request("public/get-tickers", {"instrument_name": instrument})
+            candle_result = crypto_request(
+                "public/get-candlestick",
+                {"instrument_name": instrument, "timeframe": timeframe, "count": 50},
+            )
+        ticker_raw = ticker_result.get("data", ticker_result)
+        ticker = ticker_raw[0] if isinstance(ticker_raw, list) and ticker_raw else ticker_raw
+        candles = pd.DataFrame(candle_result.get("data", [])).rename(columns={
+            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "t": "timestamp",
+        })
+        if not ticker or candles.empty:
+            st.warning("Crypto.com returned no data for this pair and interval. Choose another pair or interval.")
+            st.stop()
+        for column in ["open", "high", "low", "close", "volume"]:
+            if column in candles:
+                candles[column] = pd.to_numeric(candles[column], errors="coerce")
+        candles["timestamp"] = pd.to_datetime(candles["timestamp"], unit="ms", utc=True, errors="coerce")
+        candles = candles.dropna(subset=["timestamp", "open", "high", "low", "close"]).sort_values("timestamp")
+        if candles.empty:
+            st.warning("Crypto.com returned candles without valid prices. Try another interval.")
+            st.stop()
+
+        latest = float(ticker.get("a") or candles["close"].iloc[-1])
+        change = float(ticker.get("c") or 0) * 100
+        high_24h = float(ticker.get("h") or candles["high"].max())
+        low_24h = float(ticker.get("l") or candles["low"].min())
+        volume_24h = float(ticker.get("v") or 0)
+        ticker_time = ticker.get("t")
+        ticker_time_text = (
+            pd.to_datetime(int(ticker_time), unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if ticker_time else "timestamp not provided"
+        )
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(f"{instrument} last price", f"{latest:,.4f}", f"{change:+.2f}% · 24h")
+        m2.metric("24h high / low", f"{high_24h:,.4f} / {low_24h:,.4f}")
+        m3.metric("24h base volume", f"{volume_24h:,.4f}")
+        candle_return = float(candles["close"].iloc[-1] / candles["close"].iloc[0] - 1)
+        m4.metric(f"{timeframe} candle-window return", f"{candle_return:+.2%}")
+        st.caption(
+            f"Crypto.com Exchange snapshot at {ticker_time_text}. "
+            f"{len(candles)} {timeframe} candles cover "
+            f"{candles['timestamp'].iloc[0]:%Y-%m-%d %H:%M} to {candles['timestamp'].iloc[-1]:%Y-%m-%d %H:%M} UTC."
+        )
+        market_context = "\n".join([
+            "Source: Crypto.com Exchange public spot-market API",
+            f"Selected crypto pair: {instrument}",
+            f"Ticker snapshot timestamp: {ticker_time_text}",
+            f"Last traded price: {latest:.8g}",
+            f"24-hour price change: {change:+.4f}%",
+            f"24-hour high / low: {high_24h:.8g} / {low_24h:.8g}",
+            f"24-hour base volume: {volume_24h:.8g}",
+            f"Candle interval: {timeframe}; candles returned: {len(candles)}",
+            f"Candle window: {candles['timestamp'].iloc[0]} through {candles['timestamp'].iloc[-1]}",
+            f"Candle-window return: {candle_return:+.4f}%",
+            f"Candle-window high / low: {candles['high'].max():.8g} / {candles['low'].min():.8g}",
+            "This is a crypto exchange snapshot, not equity/stock data or personalized financial advice.",
+        ])
+    except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        st.error(f"Could not load Crypto.com market context: {exc}")
+        st.info("Check your connection or select another supported Crypto.com spot pair.")
+        st.stop()
+
+    api_key = get_gemini_api_key()
+    if api_key:
+        st.caption("Gemini is connected using the server-side API key.")
+    else:
+        st.info(
+            "Live Crypto.com market data is available. To enable Gemini replies, configure "
+            "`GEMINI_API_KEY` on the server once; there is no API-key field in StockChat."
+        )
+
+    chat_key = f"stockchat_messages_{instrument}_{timeframe}"
+
+    chat_messages = st.session_state.setdefault(chat_key, [])
+    clear_col, _ = st.columns([1, 5])
+    with clear_col:
+        if st.button("Clear StockChat", key="stockchat_clear"):
+            st.session_state[chat_key] = []
+            chat_messages = st.session_state[chat_key]
+    question = st.chat_input(
+        f"Ask Gemini about {instrument} or crypto markets",
+        max_chars=1500,
+        disabled=not api_key,
+        key="stockchat_input",
+    )
+    if question:
+        try:
+            with st.spinner("Gemini is preparing a market-context answer…"):
+                answer = gemini_advisor_reply(api_key, market_context, chat_messages, question)
+        except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            st.error(f"Could not get a StockChat response: {exc}")
+            st.info("Check the Gemini API key and quota, then try again.")
+        else:
+            chat_messages.extend([
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ])
+            del chat_messages[:-20]
+    for message in chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    st.warning("Market data may be delayed or incomplete. Gemini responses are generated educational information, not investment advice.")
+    st.stop()
+
 if page == "Live Crypto.com":
     st.markdown('<div class="section-title">Crypto.com Exchange · Live market data</div>', unsafe_allow_html=True)
     st.caption("Public spot-market data from Crypto.com Exchange. No API key is required for these read-only endpoints.")
@@ -118,7 +388,7 @@ if page == "Live Crypto.com":
     with pair_col:
         instrument = st.selectbox("Trading pair", ["BTC_USDT", "ETH_USDT", "CRO_USD", "SOL_USDT", "XRP_USDT", "BTC_USD", "ETH_USD", "ADA_USDT", "DOGE_USDT", "LINK_USDT"])
     with frame_col:
-        timeframe = st.selectbox("Candle interval", ["1m", "5m", "15m", "30m", "1h", "4h", "12h", "1D", "7D", "14D", "1M"], index=4)
+        timeframe = st.selectbox("Candle interval", ["1m", "5m", "15m", "1h", "2h", "4h", "12h", "1D", "7D", "14D", "1M"], index=3)
     with refresh_col:
         st.write("")
         if st.button("Refresh live data", use_container_width=True):
@@ -126,35 +396,48 @@ if page == "Live Crypto.com":
             st.rerun()
     try:
         with st.spinner(f"Fetching {instrument} market data from Crypto.com…"):
-            ticker_result = crypto_request("public/get-ticker", {"instrument_name": instrument})
-            candle_result = crypto_request("public/get-candlestick", {"instrument_name": instrument, "timeframe": timeframe})
+            ticker_result = crypto_request("public/get-tickers", {"instrument_name": instrument})
+            candle_result = crypto_request("public/get-candlestick", {"instrument_name": instrument, "timeframe": timeframe, "count": 50})
         ticker_raw = ticker_result.get("data", ticker_result)
         ticker = ticker_raw[0] if isinstance(ticker_raw, list) and ticker_raw else ticker_raw
         candles_raw = candle_result.get("data", [])
-        candles = pd.DataFrame(candles_raw)
+        candles = pd.DataFrame(candles_raw).rename(columns={
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+            "t": "timestamp",
+        })
         if not ticker or candles.empty:
             st.warning("Crypto.com returned no market data for this pair and interval. Try another spot pair.")
             st.stop()
         for col in ["open", "high", "low", "close", "volume", "volume_usd"]:
             if col in candles:
                 candles[col] = pd.to_numeric(candles[col], errors="coerce")
-        candles["timestamp"] = pd.to_datetime(candles["timestamp"], utc=True, errors="coerce")
+        candles["timestamp"] = pd.to_datetime(candles["timestamp"], unit="ms", utc=True, errors="coerce")
         candles = candles.dropna(subset=["timestamp", "open", "high", "low", "close"]).sort_values("timestamp")
-        latest = float(ticker.get("last", candles["close"].iloc[-1]))
-        change = float(ticker.get("change", 0)) * 100
-        high_24h = float(ticker.get("high", candles["high"].max()))
-        low_24h = float(ticker.get("low", candles["low"].min()))
-        volume_24h = float(ticker.get("volume", 0))
-        value_24h = float(ticker.get("volume_value", 0))
-        bid = float(ticker.get("best_bid", 0))
-        ask = float(ticker.get("best_ask", 0))
-        spread = ((ask / bid) - 1) * 10000 if bid > 0 and ask > 0 else 0
+        latest = float(ticker.get("a") or ticker.get("last") or candles["close"].iloc[-1])
+        change = float(ticker.get("c") or ticker.get("change") or 0) * 100
+        high_24h = float(ticker.get("h") or ticker.get("high") or candles["high"].max())
+        low_24h = float(ticker.get("l") or ticker.get("low") or candles["low"].min())
+        volume_24h = float(ticker.get("v") or ticker.get("volume") or 0)
+        value_24h = float(ticker.get("vv") or ticker.get("volume_value") or 0)
+        bid_value = ticker.get("b", ticker.get("best_bid"))
+        ask_value = ticker.get("k", ticker.get("best_ask"))
+        bid = float(bid_value) if bid_value is not None else None
+        ask = float(ask_value) if ask_value is not None else None
+        spread = ((ask / bid) - 1) * 10000 if bid and ask and bid > 0 and ask > 0 else None
         k1,k2,k3,k4,k5 = st.columns(5)
         k1.metric("Last traded price", f"{latest:,.4f}", f"{change:+.2f}% · 24h")
         k2.metric("24h high / low", f"{high_24h:,.4f} / {low_24h:,.4f}")
         k3.metric("24h base volume", f"{volume_24h:,.4f}")
         k4.metric("24h traded value", f"{value_24h:,.2f}")
-        k5.metric("Best bid / ask spread", f"{spread:.2f} bps", f"{bid:,.4f} / {ask:,.4f}")
+        k5.metric(
+            "Best bid / ask spread",
+            f"{spread:.2f} bps" if spread is not None else "—",
+            f"{bid:,.4f} / {ask:,.4f}" if bid is not None and ask is not None else "Bid/ask unavailable",
+        )
 
         candle_fig = go.Figure(go.Candlestick(x=candles["timestamp"], open=candles["open"], high=candles["high"], low=candles["low"], close=candles["close"], name=instrument))
         candle_fig.update_layout(template="plotly_dark", height=460, xaxis_rangeslider_visible=False, xaxis_title="Time (UTC)", yaxis_title="Quote price", margin=dict(l=10,r=10,t=20,b=10))
@@ -172,8 +455,12 @@ if page == "Live Crypto.com":
         st.markdown('<div class="section-title">Recent OHLCV candles</div>', unsafe_allow_html=True)
         show_cols=[c for c in ["timestamp","open","high","low","close","volume","volume_usd"] if c in candles.columns]
         st.dataframe(candles[show_cols].sort_values("timestamp",ascending=False).head(20),use_container_width=True,hide_index=True)
-        observed=ticker.get("timestamp") or ticker.get("t")
-        st.caption(f"Source: Crypto.com Exchange public API · {instrument} · {timeframe} candles · {len(candles)} candles returned (API limit up to 50) · Ticker timestamp: {observed or 'not provided'}")
+        observed=ticker.get("t") or ticker.get("timestamp")
+        observed_text = (
+            pd.to_datetime(int(observed), unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if observed else "not provided"
+        )
+        st.caption(f"Source: Crypto.com Exchange public API · {instrument} · {timeframe} candles · {len(candles)} candles returned · Ticker timestamp: {observed_text}")
         st.warning("Market data is informational only and may be delayed or incomplete. Candle-based returns and drawdowns describe only the candles returned, not a complete backtest. No investment advice.")
     except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
         st.error(f"Could not load Crypto.com data: {exc}")
@@ -202,8 +489,6 @@ if data.empty:
     st.error("The uploaded file has no rows.")
     st.stop()
 data.columns = [str(c).strip() for c in data.columns]
-
-# Column detection is case-insensitive and supports common vendor labels.
 def find_column(candidates):
     mapping = {str(c).strip().lower().replace("_", " "): c for c in data.columns}
     for candidate in candidates:
@@ -290,17 +575,14 @@ if page == "Overview":
         "Your question and recent chat are sent to Google. This app has no live news feed or brokerage/account connection. "
         "Generated answers can be wrong and are not professional financial advice."
     )
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = get_gemini_api_key()
     if api_key:
-        st.caption("Using the Gemini API key configured in the server environment.")
+        st.caption("Gemini is connected using the server-side API key.")
     else:
-        with st.expander("Connect Gemini", expanded=True):
-            api_key = st.text_input(
-                "Google AI Studio API key",
-                type="password",
-                key="marketlens_gemini_api_key",
-            ).strip()
-            st.caption("The key is used for this session's Gemini requests. It is not written to the uploaded file.")
+        st.info(
+            "Configure `GEMINI_API_KEY` in the server environment or "
+            "`.streamlit/secrets.toml` to enable Gemini replies; no key is needed in chat."
+        )
     if st.session_state.get("marketlens_advisor_context") != advisor_context:
         st.session_state["marketlens_advisor_context"] = advisor_context
         st.session_state["marketlens_advisor_messages"] = []
